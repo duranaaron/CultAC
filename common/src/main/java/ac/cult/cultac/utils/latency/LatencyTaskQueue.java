@@ -1,14 +1,22 @@
 package ac.cult.cultac.utils.latency;
 
+import java.util.Arrays;
+import java.util.Comparator;
+
 final class LatencyTaskQueue {
     private static final int MAX_RECYCLED_TASKS = 256;
     private static final int RUNS = 4;
+    private static final int OVERFLOW_CAPACITY = 16;
+    private static final int RETAINED_OVERFLOW_CAPACITY = 1024;
+    private static final Comparator<TaskNode> BY_SEQUENCE = (a, b) -> Long.compare(a.sequence, b.sequence);
     // Each run keeps its tasks in insertion order with non-decreasing transactions, so its ready tasks are a prefix.
     private final TaskNode[] runFirst = new TaskNode[RUNS];
     private final TaskNode[] runLast = new TaskNode[RUNS];
-    // Tasks no run could take, in insertion order with any transactions.
-    private TaskNode firstTask;
-    private TaskNode lastTask;
+    // Tasks no run could take: a min-heap on (transaction, sequence), so a drain pops only the ready ones.
+    private TaskNode[] overflow = new TaskNode[OVERFLOW_CAPACITY];
+    private int overflowSize;
+    // Ready overflow tasks of one drain, sorted back into insertion order; empty between drains.
+    private TaskNode[] overflowReady = new TaskNode[OVERFLOW_CAPACITY];
     // Insertion order across the runs and the overflow; a continuation keeps its task's sequence.
     private long nextSequence;
     private TaskNode recycledTasks;
@@ -71,16 +79,11 @@ final class LatencyTaskQueue {
                 return;
             }
         }
-        if (lastTask == null) {
-            firstTask = task;
-        } else {
-            lastTask.next = task;
-        }
-        lastTask = task;
+        pushOverflow(task);
     }
 
     synchronized TaskNode drainReady(int transaction) {
-        if (runFirst[1] == null && runFirst[2] == null && runFirst[3] == null && firstTask == null) {
+        if (runFirst[1] == null && runFirst[2] == null && runFirst[3] == null && overflowSize == 0) {
             return drainRun(0, transaction);
         }
         TaskNode ready = null;
@@ -162,89 +165,77 @@ final class LatencyTaskQueue {
         return readyFirst;
     }
 
+    /**
+     * The overflow's ready tasks in insertion order, a continuation that is also ready right after its task. Pops only
+     * ready tasks, so a pong costs the ready work, not the tasks still waiting. A continuation that is not ready goes
+     * back in with its task's sequence, which keeps its place in the order.
+     */
     private TaskNode drainOverflow(int transaction) {
-        TaskNode previous = null;
-        TaskNode current = firstTask;
-        TaskNode readyFirst = null;
-        TaskNode readyLast = null;
-
-        while (current != null) {
-            TaskNode next = current.next;
-            if (transaction < current.transaction) {
-                previous = current;
-                current = next;
-                continue;
-            }
-
+        int count = 0;
+        while (overflowSize > 0 && overflow[0].transaction <= transaction) {
+            TaskNode current = popOverflow();
             TaskNode continuation = nextTransactionTask(current);
             if (continuation != null) {
                 if (continuation.transaction <= transaction) {
-                    if (previous == null) {
-                        firstTask = next;
-                    } else {
-                        previous.next = next;
-                    }
-                    if (lastTask == current) {
-                        lastTask = previous;
-                    }
-
                     current.next = continuation;
-                    if (readyFirst == null) {
-                        readyFirst = current;
-                    } else {
-                        readyLast.next = current;
-                    }
-                    readyLast = continuation;
-                    current = next;
-                    continue;
-                }
-
-                continuation.next = next;
-                if (previous == null) {
-                    firstTask = continuation;
                 } else {
-                    previous.next = continuation;
+                    pushOverflow(continuation);
                 }
-                if (lastTask == current) {
-                    lastTask = continuation;
-                }
-
-                current.next = null;
-                if (readyFirst == null) {
-                    readyFirst = current;
-                } else {
-                    readyLast.next = current;
-                }
-                readyLast = current;
-                previous = continuation;
-                current = next;
-                continue;
             }
-
-            if (previous == null) {
-                firstTask = next;
-            } else {
-                previous.next = next;
-            }
-            if (lastTask == current) {
-                lastTask = previous;
-            }
-
-            current.next = null;
-            if (readyFirst == null) {
-                readyFirst = current;
-            } else {
-                readyLast.next = current;
-            }
-            readyLast = current;
-            current = next;
+            if (count == overflowReady.length) overflowReady = Arrays.copyOf(overflowReady, count * 2);
+            overflowReady[count++] = current;
         }
-
-        if (firstTask == null) {
-            lastTask = null;
+        if (count == 0) return null;
+        Arrays.sort(overflowReady, 0, count, BY_SEQUENCE);
+        TaskNode readyFirst = overflowReady[0];
+        TaskNode readyLast = null;
+        for (int i = 0; i < count; i++) {
+            TaskNode task = overflowReady[i];
+            overflowReady[i] = null;
+            if (readyLast != null) readyLast.next = task;
+            readyLast = task.next != null ? task.next : task;
         }
-        if (readyLast != null) readyLast.next = null;
+        if (overflowReady.length > RETAINED_OVERFLOW_CAPACITY) overflowReady = new TaskNode[OVERFLOW_CAPACITY];
         return readyFirst;
+    }
+
+    private void pushOverflow(TaskNode task) {
+        if (overflowSize == overflow.length) overflow = Arrays.copyOf(overflow, overflowSize * 2);
+        int index = overflowSize++;
+        while (index > 0) {
+            int parent = (index - 1) >>> 1;
+            if (!before(task, overflow[parent])) break;
+            overflow[index] = overflow[parent];
+            index = parent;
+        }
+        overflow[index] = task;
+    }
+
+    private TaskNode popOverflow() {
+        TaskNode top = overflow[0];
+        TaskNode last = overflow[--overflowSize];
+        overflow[overflowSize] = null;
+        if (overflowSize == 0) {
+            // A lagging client can grow the heap to thousands of slots; do not keep that for the whole session.
+            if (overflow.length > RETAINED_OVERFLOW_CAPACITY) overflow = new TaskNode[OVERFLOW_CAPACITY];
+            return top;
+        }
+        int index = 0;
+        int half = overflowSize >>> 1;
+        while (index < half) {
+            int child = 2 * index + 1;
+            int right = child + 1;
+            if (right < overflowSize && before(overflow[right], overflow[child])) child = right;
+            if (!before(overflow[child], last)) break;
+            overflow[index] = overflow[child];
+            index = child;
+        }
+        overflow[index] = last;
+        return top;
+    }
+
+    private static boolean before(TaskNode a, TaskNode b) {
+        return a.transaction < b.transaction || (a.transaction == b.transaction && a.sequence < b.sequence);
     }
 
     static final class TaskNode {

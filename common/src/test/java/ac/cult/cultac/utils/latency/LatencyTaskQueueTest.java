@@ -108,6 +108,36 @@ public class LatencyTaskQueueTest {
         assertEquals(List.of(2, 3, 100), applied);
     }
 
+    /**
+     * A lagging client parks many tasks in the overflow while it keeps answering older transactions. Each pong must
+     * cost the ready work only: with a full overflow scan this is 10^10 node visits and runs for minutes.
+     */
+    @Test(timeout = 10_000)
+    public void waitingOverflowTasksDoNotCostEveryPong() {
+        var queue = new LatencyTaskQueue();
+        var applied = new ArrayList<Integer>();
+        // Four descending transactions fill the four runs, so every lower transaction goes to the overflow.
+        for (int run = 0; run < 4; run++) queue.add(1_000_000 - run, () -> {});
+        int waiting = 100_000;
+        for (int id = 0; id < waiting; id++) {
+            int task = id;
+            queue.addWithNextTransaction(500_000, () -> applied.add(task), () -> applied.add(-task - 1));
+        }
+        for (int pong = 0; pong < 100_000; pong++) {
+            int ready = pong;
+            queue.add(pong, () -> applied.add(waiting + ready));
+            drain(queue, pong);
+        }
+        assertEquals(100_000, applied.size());
+        for (int pong = 0; pong < 100_000; pong++) assertEquals(waiting + pong, (int) applied.get(pong));
+        applied.clear();
+        drain(queue, 500_000);
+        for (int id = 0; id < waiting; id++) assertEquals(id, (int) applied.get(id));
+        applied.clear();
+        drain(queue, 500_001);
+        for (int id = 0; id < waiting; id++) assertEquals(-id - 1, (int) applied.get(id));
+    }
+
     @Test
     public void concurrentEnqueuesRunEveryTaskOnce() throws Exception {
         var queue = new LatencyTaskQueue();

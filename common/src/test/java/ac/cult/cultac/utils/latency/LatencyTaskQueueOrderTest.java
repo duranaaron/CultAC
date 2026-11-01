@@ -17,7 +17,7 @@ import org.junit.jupiter.api.Test;
  */
 class LatencyTaskQueueOrderTest {
     private static final Field RUN_FIRST = field(LatencyTaskQueue.class, "runFirst");
-    private static final Field FIRST_TASK = field(LatencyTaskQueue.class, "firstTask");
+    private static final Field OVERFLOW_SIZE = field(LatencyTaskQueue.class, "overflowSize");
     private static final Field TRANSACTION = field(LatencyTaskQueue.TaskNode.class, "transaction");
     private int runsBeyondFirst;
     private int overflowUsed;
@@ -52,7 +52,7 @@ class LatencyTaskQueueOrderTest {
     private void observeDrain(LatencyTaskQueue queue, int transaction) {
         try {
             Object[] first = (Object[]) RUN_FIRST.get(queue);
-            boolean othersEmpty = FIRST_TASK.get(queue) == null;
+            boolean othersEmpty = (int) OVERFLOW_SIZE.get(queue) == 0;
             int readyRuns = 0;
             for (int run = 0; run < first.length; run++) {
                 if (first[run] == null) continue;
@@ -116,7 +116,7 @@ class LatencyTaskQueueOrderTest {
     private void observe(LatencyTaskQueue queue) throws Exception {
         Object[] first = (Object[]) RUN_FIRST.get(queue);
         for (int run = 1; run < first.length; run++) if (first[run] != null) runsBeyondFirst++;
-        if (FIRST_TASK.get(queue) != null) overflowUsed++;
+        if ((int) OVERFLOW_SIZE.get(queue) != 0) overflowUsed++;
     }
 
     private interface Queue {
